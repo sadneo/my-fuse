@@ -6,6 +6,7 @@ use fuser::{
 
 use std::ffi::OsStr;
 use std::path::PathBuf;
+use std::sync::mpsc;
 use std::time::{Duration, SystemTime};
 
 use fuser::Config;
@@ -225,8 +226,16 @@ mod tests {
     }
 }
 
-fn main() {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
     let cfg = args.config();
-    fuser::mount(NullFS, &args.mount_point, &cfg).unwrap();
+    let (interrupt_tx, interrupt_rx) = mpsc::channel();
+    ctrlc::set_handler(move || {
+        let _ = interrupt_tx.send(());
+    })?;
+
+    let session = fuser::spawn_mount(NullFS, &args.mount_point, &cfg)?;
+    interrupt_rx.recv()?;
+    session.umount_and_join()?;
+    Ok(())
 }
