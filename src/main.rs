@@ -1,8 +1,8 @@
 use clap::Parser;
 use fuser::{
     FileAttr, FileHandle, FileType, Filesystem, FopenFlags, Generation, INodeNo, LockOwner,
-    OpenFlags, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEntry, ReplyOpen,
-    ReplyWrite, Request,
+    OpenFlags, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry,
+    ReplyOpen, ReplyWrite, Request,
 };
 
 use std::collections::{BTreeMap, HashMap};
@@ -149,6 +149,7 @@ impl NullFS {
         &self,
         parent: INodeNo,
         name: &OsStr,
+        kind: FileType,
         mode: u32,
         umask: u32,
         uid: u32,
@@ -171,7 +172,7 @@ impl NullFS {
         state.next_ino += 1;
         let now = SystemTime::now();
         let node = Node {
-            kind: FileType::RegularFile,
+            kind,
             perm: (mode as u16 & 0o7777) & !(umask as u16),
             uid,
             gid,
@@ -182,13 +183,35 @@ impl NullFS {
         };
         let attr = Self::attr(ino, &node);
         state.inodes.insert(ino, node);
-        state
-            .inodes
-            .get_mut(&parent)
-            .unwrap()
-            .children
-            .insert(name.to_os_string(), ino);
+        let parent_node = state.inodes.get_mut(&parent).unwrap();
+        parent_node.children.insert(name.to_os_string(), ino);
+        parent_node.mtime = now;
+        parent_node.ctime = now;
         Ok(attr)
+    }
+
+    fn unlink_node(&self, parent: INodeNo, name: &OsStr) -> Result<(), fuser::Errno> {
+        let mut state = self.state.write().unwrap();
+        let parent_node = state.inodes.get(&parent).ok_or(fuser::Errno::ENOENT)?;
+        if parent_node.kind != FileType::Directory {
+            return Err(fuser::Errno::ENOTDIR);
+        }
+        let ino = *parent_node
+            .children
+            .get(name)
+            .ok_or(fuser::Errno::ENOENT)?;
+        let node = state.inodes.get(&ino).ok_or(fuser::Errno::ENOENT)?;
+        if node.kind == FileType::Directory {
+            return Err(fuser::Errno::EISDIR);
+        }
+
+        let now = SystemTime::now();
+        let parent_node = state.inodes.get_mut(&parent).unwrap();
+        parent_node.children.remove(name);
+        parent_node.mtime = now;
+        parent_node.ctime = now;
+        state.inodes.remove(&ino);
+        Ok(())
     }
 
     fn write_node(&self, ino: INodeNo, offset: u64, data: &[u8]) -> Result<(), fuser::Errno> {
@@ -322,7 +345,15 @@ impl Filesystem for NullFS {
         _flags: i32,
         reply: ReplyCreate,
     ) {
-        match self.create_node(parent, name, mode, umask, req.uid(), req.gid()) {
+        match self.create_node(
+            parent,
+            name,
+            FileType::RegularFile,
+            mode,
+            umask,
+            req.uid(),
+            req.gid(),
+        ) {
             Ok(attr) => reply.created(
                 &Duration::from_secs(1),
                 &attr,
@@ -330,6 +361,36 @@ impl Filesystem for NullFS {
                 FileHandle(0),
                 FopenFlags::empty(),
             ),
+            Err(err) => reply.error(err),
+        }
+    }
+
+    fn mkdir(
+        &self,
+        req: &Request,
+        parent: INodeNo,
+        name: &OsStr,
+        mode: u32,
+        umask: u32,
+        reply: ReplyEntry,
+    ) {
+        match self.create_node(
+            parent,
+            name,
+            FileType::Directory,
+            mode,
+            umask,
+            req.uid(),
+            req.gid(),
+        ) {
+            Ok(attr) => reply.entry(&Duration::from_secs(1), &attr, Generation(0)),
+            Err(err) => reply.error(err),
+        }
+    }
+
+    fn unlink(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
+        match self.unlink_node(parent, name) {
+            Ok(()) => reply.ok(),
             Err(err) => reply.error(err),
         }
     }
@@ -386,6 +447,7 @@ mod tests {
             .create_node(
                 INodeNo::ROOT,
                 OsStr::new("new.txt"),
+                FileType::RegularFile,
                 0o666,
                 0o022,
                 1000,
@@ -409,6 +471,61 @@ mod tests {
 
         let state = fs.state.read().unwrap();
         assert_eq!(state.inodes[&HELLO].contents, b"hello world\0\0!");
+    }
+
+    #[test]
+    fn mkdir_adds_an_empty_directory_with_masked_permissions() {
+        let fs = NullFS::new();
+        let attr = fs
+            .create_node(
+                INodeNo::ROOT,
+                OsStr::new("docs"),
+                FileType::Directory,
+                0o777,
+                0o022,
+                1000,
+                1000,
+            )
+            .unwrap();
+
+        let state = fs.state.read().unwrap();
+        assert_eq!(attr.kind, FileType::Directory);
+        assert_eq!(attr.perm, 0o755);
+        assert!(state.inodes[&attr.ino].children.is_empty());
+        assert_eq!(state.inodes[&INodeNo::ROOT].children[OsStr::new("docs")], attr.ino);
+    }
+
+    #[test]
+    fn unlink_removes_a_file_but_not_a_directory() {
+        let fs = NullFS::new();
+        fs.create_node(
+            INodeNo::ROOT,
+            OsStr::new("docs"),
+            FileType::Directory,
+            0o755,
+            0,
+            1000,
+            1000,
+        )
+        .unwrap();
+        fs.unlink_node(INodeNo::ROOT, OsStr::new("hello.txt"))
+            .unwrap();
+
+        let state = fs.state.read().unwrap();
+        assert!(!state.inodes.contains_key(&HELLO));
+        assert!(!state.inodes[&INodeNo::ROOT]
+            .children
+            .contains_key(OsStr::new("hello.txt")));
+        drop(state);
+
+        assert_eq!(
+            fs.unlink_node(INodeNo::ROOT, OsStr::new("missing.txt")),
+            Err(fuser::Errno::ENOENT)
+        );
+        assert_eq!(
+            fs.unlink_node(INodeNo::ROOT, OsStr::new("docs")),
+            Err(fuser::Errno::EISDIR)
+        );
     }
 }
 
