@@ -69,6 +69,7 @@ struct Node {
     gid: u32,
     contents: Vec<u8>,
     children: BTreeMap<OsString, INodeNo>,
+    atime: SystemTime,
     mtime: SystemTime,
     ctime: SystemTime,
 }
@@ -95,6 +96,7 @@ impl NullFS {
                 gid: 0,
                 contents: Vec::new(),
                 children: BTreeMap::from([(OsString::from("hello.txt"), HELLO)]),
+                atime: now,
                 mtime: now,
                 ctime: now,
             },
@@ -108,6 +110,7 @@ impl NullFS {
                 gid: 0,
                 contents: b"hello world".to_vec(),
                 children: BTreeMap::new(),
+                atime: now,
                 mtime: now,
                 ctime: now,
             },
@@ -126,7 +129,7 @@ impl NullFS {
             ino,
             size: node.contents.len() as u64,
             blocks: 0,
-            atime: SystemTime::UNIX_EPOCH,
+            atime: node.atime,
             mtime: node.mtime,
             ctime: node.ctime,
             crtime: SystemTime::UNIX_EPOCH,
@@ -178,6 +181,7 @@ impl NullFS {
             gid,
             contents: Vec::new(),
             children: BTreeMap::new(),
+            atime: now,
             mtime: now,
             ctime: now,
         };
@@ -214,6 +218,94 @@ impl NullFS {
         Ok(())
     }
 
+    fn setattr_node(
+        &self,
+        ino: INodeNo,
+        mode: Option<u32>,
+        uid: Option<u32>,
+        gid: Option<u32>,
+        size: Option<u64>,
+        atime: Option<fuser::TimeOrNow>,
+        mtime: Option<fuser::TimeOrNow>,
+        ctime: Option<SystemTime>,
+    ) -> Result<FileAttr, fuser::Errno> {
+        let size = size
+            .map(|size| usize::try_from(size).map_err(|_| fuser::Errno::EFBIG))
+            .transpose()?;
+        let mut state = self.state.write().unwrap();
+        let node = state.inodes.get_mut(&ino).ok_or(fuser::Errno::ENOENT)?;
+        if size.is_some() && node.kind != FileType::RegularFile {
+            return Err(fuser::Errno::EISDIR);
+        }
+
+        let now = SystemTime::now();
+        let changed = mode.is_some()
+            || uid.is_some()
+            || gid.is_some()
+            || size.is_some()
+            || atime.is_some()
+            || mtime.is_some();
+        if let Some(mode) = mode {
+            node.perm = mode as u16 & 0o7777;
+        }
+        if let Some(uid) = uid {
+            node.uid = uid;
+        }
+        if let Some(gid) = gid {
+            node.gid = gid;
+        }
+        if let Some(size) = size {
+            node.contents.resize(size, 0);
+        }
+        if let Some(atime) = atime {
+            node.atime = match atime {
+                fuser::TimeOrNow::SpecificTime(time) => time,
+                fuser::TimeOrNow::Now => now,
+            };
+        }
+        if let Some(mtime) = mtime {
+            node.mtime = match mtime {
+                fuser::TimeOrNow::SpecificTime(time) => time,
+                fuser::TimeOrNow::Now => now,
+            };
+        } else if size.is_some() {
+            node.mtime = now;
+        }
+        if let Some(ctime) = ctime {
+            node.ctime = ctime;
+        } else if changed {
+            node.ctime = now;
+        }
+        Ok(Self::attr(ino, node))
+    }
+
+    fn rmdir_node(&self, parent: INodeNo, name: &OsStr) -> Result<(), fuser::Errno> {
+        let mut state = self.state.write().unwrap();
+        let parent_node = state.inodes.get(&parent).ok_or(fuser::Errno::ENOENT)?;
+        if parent_node.kind != FileType::Directory {
+            return Err(fuser::Errno::ENOTDIR);
+        }
+        let ino = *parent_node
+            .children
+            .get(name)
+            .ok_or(fuser::Errno::ENOENT)?;
+        let node = state.inodes.get(&ino).ok_or(fuser::Errno::ENOENT)?;
+        if node.kind != FileType::Directory {
+            return Err(fuser::Errno::ENOTDIR);
+        }
+        if !node.children.is_empty() {
+            return Err(fuser::Errno::ENOTEMPTY);
+        }
+
+        let now = SystemTime::now();
+        let parent_node = state.inodes.get_mut(&parent).unwrap();
+        parent_node.children.remove(name);
+        parent_node.mtime = now;
+        parent_node.ctime = now;
+        state.inodes.remove(&ino);
+        Ok(())
+    }
+
     fn write_node(&self, ino: INodeNo, offset: u64, data: &[u8]) -> Result<(), fuser::Errno> {
         let start = usize::try_from(offset).map_err(|_| fuser::Errno::EFBIG)?;
         let end = start.checked_add(data.len()).ok_or(fuser::Errno::EFBIG)?;
@@ -239,6 +331,30 @@ impl Filesystem for NullFS {
         };
 
         reply.attr(&Duration::from_secs(1), &Self::attr(ino, node));
+    }
+
+    fn setattr(
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        mode: Option<u32>,
+        uid: Option<u32>,
+        gid: Option<u32>,
+        size: Option<u64>,
+        atime: Option<fuser::TimeOrNow>,
+        mtime: Option<fuser::TimeOrNow>,
+        ctime: Option<SystemTime>,
+        _fh: Option<FileHandle>,
+        _crtime: Option<SystemTime>,
+        _chgtime: Option<SystemTime>,
+        _bkuptime: Option<SystemTime>,
+        _flags: Option<fuser::BsdFileFlags>,
+        reply: ReplyAttr,
+    ) {
+        match self.setattr_node(ino, mode, uid, gid, size, atime, mtime, ctime) {
+            Ok(attr) => reply.attr(&Duration::from_secs(1), &attr),
+            Err(err) => reply.error(err),
+        }
     }
 
     fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
@@ -395,6 +511,13 @@ impl Filesystem for NullFS {
         }
     }
 
+    fn rmdir(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
+        match self.rmdir_node(parent, name) {
+            Ok(()) => reply.ok(),
+            Err(err) => reply.error(err),
+        }
+    }
+
     fn open(&self, _req: &Request, ino: INodeNo, _flags: OpenFlags, reply: ReplyOpen) {
         let state = self.state.read().unwrap();
         match state.inodes.get(&ino) {
@@ -474,6 +597,43 @@ mod tests {
     }
 
     #[test]
+    fn setattr_updates_metadata_and_truncates_files() {
+        let fs = NullFS::new();
+        let atime = SystemTime::UNIX_EPOCH + Duration::from_secs(10);
+        let mtime = SystemTime::UNIX_EPOCH + Duration::from_secs(20);
+        let attr = fs
+            .setattr_node(
+                HELLO,
+                Some(0o600),
+                Some(1000),
+                Some(1001),
+                Some(5),
+                Some(fuser::TimeOrNow::SpecificTime(atime)),
+                Some(fuser::TimeOrNow::SpecificTime(mtime)),
+                None,
+            )
+            .unwrap();
+
+        assert_eq!(attr.size, 5);
+        assert_eq!(attr.perm, 0o600);
+        assert_eq!(attr.uid, 1000);
+        assert_eq!(attr.gid, 1001);
+        assert_eq!(attr.atime, atime);
+        assert_eq!(attr.mtime, mtime);
+        assert_eq!(fs.state.read().unwrap().inodes[&HELLO].contents, b"hello");
+    }
+
+    #[test]
+    fn setattr_cannot_truncate_a_directory() {
+        let fs = NullFS::new();
+
+        assert_eq!(
+            fs.setattr_node(INodeNo::ROOT, None, None, None, Some(0), None, None, None),
+            Err(fuser::Errno::EISDIR)
+        );
+    }
+
+    #[test]
     fn mkdir_adds_an_empty_directory_with_masked_permissions() {
         let fs = NullFS::new();
         let attr = fs
@@ -525,6 +685,58 @@ mod tests {
         assert_eq!(
             fs.unlink_node(INodeNo::ROOT, OsStr::new("docs")),
             Err(fuser::Errno::EISDIR)
+        );
+    }
+
+    #[test]
+    fn rmdir_removes_empty_directories_only() {
+        let fs = NullFS::new();
+        let empty = fs
+            .create_node(
+                INodeNo::ROOT,
+                OsStr::new("empty"),
+                FileType::Directory,
+                0o755,
+                0,
+                1000,
+                1000,
+            )
+            .unwrap()
+            .ino;
+        fs.rmdir_node(INodeNo::ROOT, OsStr::new("empty"))
+            .unwrap();
+        assert!(!fs.state.read().unwrap().inodes.contains_key(&empty));
+
+        let full = fs
+            .create_node(
+                INodeNo::ROOT,
+                OsStr::new("full"),
+                FileType::Directory,
+                0o755,
+                0,
+                1000,
+                1000,
+            )
+            .unwrap()
+            .ino;
+        fs.create_node(
+            full,
+            OsStr::new("child"),
+            FileType::RegularFile,
+            0o644,
+            0,
+            1000,
+            1000,
+        )
+        .unwrap();
+
+        assert_eq!(
+            fs.rmdir_node(INodeNo::ROOT, OsStr::new("full")),
+            Err(fuser::Errno::ENOTEMPTY)
+        );
+        assert_eq!(
+            fs.rmdir_node(INodeNo::ROOT, OsStr::new("hello.txt")),
+            Err(fuser::Errno::ENOTDIR)
         );
     }
 }
