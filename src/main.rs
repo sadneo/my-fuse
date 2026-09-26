@@ -1,3 +1,4 @@
+mod debug;
 mod repl;
 
 use clap::Parser;
@@ -10,7 +11,7 @@ use fuser::{
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::{OsStr, OsString};
 use std::path::PathBuf;
-use std::sync::RwLock;
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime};
 
 use fuser::Config;
@@ -80,8 +81,9 @@ struct FsState {
     inodes: HashMap<INodeNo, Node>,
 }
 
+#[derive(Clone)]
 struct NullFS {
-    state: RwLock<FsState>,
+    state: Arc<RwLock<FsState>>,
 }
 
 impl NullFS {
@@ -118,10 +120,10 @@ impl NullFS {
         );
 
         Self {
-            state: RwLock::new(FsState {
+            state: Arc::new(RwLock::new(FsState {
                 next_ino: HELLO.0 + 1,
                 inodes,
-            }),
+            })),
         }
     }
 
@@ -1084,17 +1086,11 @@ mod tests {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
     let cfg = args.config();
-    let session = fuser::spawn_mount(NullFS::new(), &args.mount_point, &cfg)?;
-    let mut repl = repl::Repl::new()?;
-
-    loop {
-        match repl.read_command()? {
-            repl::Command::Help => println!("Commands: help, exit, quit"),
-            repl::Command::Exit => break,
-            repl::Command::Unknown(command) => eprintln!("unknown command: {command}"),
-        }
-    }
-
-    session.umount_and_join()?;
+    let fs = NullFS::new();
+    let session = fuser::spawn_mount(fs.clone(), &args.mount_point, &cfg)?;
+    let debug_result = debug::run(&fs);
+    let unmount_result = session.umount_and_join();
+    debug_result?;
+    unmount_result?;
     Ok(())
 }

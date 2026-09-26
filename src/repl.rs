@@ -6,14 +6,9 @@ use rustyline::highlight::Highlighter;
 use rustyline::hint::HistoryHinter;
 use rustyline::{Completer, Editor, Helper, Hinter, Validator};
 
-const PROMPT: &str = "debug> ";
+use crate::debug::Command;
 
-#[derive(Debug, PartialEq, Eq)]
-pub enum Command {
-    Help,
-    Exit,
-    Unknown(String),
-}
+const PROMPT: &str = "debug> ";
 
 #[derive(Completer, Helper, Hinter, Validator)]
 struct ReplHelper {
@@ -25,7 +20,7 @@ impl Highlighter for ReplHelper {
     fn highlight<'line>(&self, line: &'line str, _pos: usize) -> Cow<'line, str> {
         let command = line.split_whitespace().next().unwrap_or_default();
         let color = match command {
-            "help" => "\x1b[36m",
+            "help" | "state" | "tree" | "stat" | "cat" => "\x1b[36m",
             "exit" | "quit" => "\x1b[33m",
             "" => return Cow::Borrowed(line),
             _ => "\x1b[31m",
@@ -71,9 +66,23 @@ impl Repl {
 }
 
 fn parse(line: &str) -> Command {
-    match line.trim() {
+    let line = line.trim();
+    match line {
+        "" => Command::Empty,
         "help" => Command::Help,
+        "state" => Command::State,
+        "tree" => Command::Tree,
         "exit" | "quit" => Command::Exit,
+        command if command.starts_with("stat ") => match command[5..].trim().parse() {
+            Ok(ino) => Command::Stat(fuser::INodeNo(ino)),
+            Err(_) => Command::Invalid("usage: stat <inode>".into()),
+        },
+        "stat" => Command::Invalid("usage: stat <inode>".into()),
+        command if command.starts_with("cat ") => match command[4..].trim().parse() {
+            Ok(ino) => Command::Cat(fuser::INodeNo(ino)),
+            Err(_) => Command::Invalid("usage: cat <inode>".into()),
+        },
+        "cat" => Command::Invalid("usage: cat <inode>".into()),
         command => Command::Unknown(command.to_owned()),
     }
 }
@@ -86,6 +95,12 @@ mod tests {
     fn parses_commands() {
         assert_eq!(parse(" help "), Command::Help);
         assert_eq!(parse("quit"), Command::Exit);
+        assert_eq!(parse("stat 2"), Command::Stat(fuser::INodeNo(2)));
+        assert_eq!(parse("cat 2"), Command::Cat(fuser::INodeNo(2)));
+        assert_eq!(
+            parse("stat nope"),
+            Command::Invalid("usage: stat <inode>".into())
+        );
         assert_eq!(parse("wat"), Command::Unknown("wat".into()));
     }
 }
