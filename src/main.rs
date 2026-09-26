@@ -1,4 +1,5 @@
 mod debug;
+mod discord;
 mod repl;
 
 use clap::Parser;
@@ -64,6 +65,7 @@ impl Args {
 
 const HELLO: INodeNo = INodeNo(2);
 
+#[derive(Clone)]
 struct Node {
     kind: FileType,
     perm: u16,
@@ -76,6 +78,7 @@ struct Node {
     ctime: SystemTime,
 }
 
+#[derive(Clone)]
 struct FsState {
     next_ino: u64,
     inodes: HashMap<INodeNo, Node>,

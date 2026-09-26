@@ -20,7 +20,7 @@ impl Highlighter for ReplHelper {
     fn highlight<'line>(&self, line: &'line str, _pos: usize) -> Cow<'line, str> {
         let command = line.split_whitespace().next().unwrap_or_default();
         let color = match command {
-            "help" | "state" | "tree" | "stat" | "cat" => "\x1b[36m",
+            "help" | "state" | "tree" | "stat" | "cat" | "upload-all" => "\x1b[36m",
             "exit" | "quit" => "\x1b[33m",
             "" => return Cow::Borrowed(line),
             _ => "\x1b[31m",
@@ -72,6 +72,7 @@ fn parse(line: &str) -> Command {
         "help" => Command::Help,
         "state" => Command::State,
         "tree" => Command::Tree,
+        "upload-all" => Command::UploadAll,
         "exit" | "quit" => Command::Exit,
         command if command.starts_with("stat ") => match command[5..].trim().parse() {
             Ok(ino) => Command::Stat(fuser::INodeNo(ino)),
@@ -97,6 +98,7 @@ mod tests {
         assert_eq!(parse("quit"), Command::Exit);
         assert_eq!(parse("stat 2"), Command::Stat(fuser::INodeNo(2)));
         assert_eq!(parse("cat 2"), Command::Cat(fuser::INodeNo(2)));
+        assert_eq!(parse("upload-all"), Command::UploadAll);
         assert_eq!(
             parse("stat nope"),
             Command::Invalid("usage: stat <inode>".into())

@@ -1,6 +1,6 @@
 use fuser::{FileType, INodeNo};
 
-use crate::{FsState, NullFS, repl::Repl};
+use crate::{FsState, NullFS, discord::DiscordClient, repl::Repl};
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Command {
@@ -10,6 +10,7 @@ pub enum Command {
     Tree,
     Stat(INodeNo),
     Cat(INodeNo),
+    UploadAll,
     Exit,
     Invalid(String),
     Unknown(String),
@@ -21,18 +22,36 @@ pub fn run(fs: &NullFS) -> rustyline::Result<()> {
         match repl.read_command()? {
             Command::Empty => {}
             Command::Help => {
-                println!("Commands: help, state, tree, stat <inode>, cat <inode>, exit, quit")
+                println!(
+                    "Commands: help, state, tree, stat <inode>, cat <inode>, upload-all, exit, quit"
+                )
             }
             Command::State => print_state(fs),
             Command::Tree => print_tree(fs),
             Command::Stat(ino) => print_stat(fs, ino),
             Command::Cat(ino) => print_cat(fs, ino),
+            Command::UploadAll => upload_all(fs),
             Command::Exit => break,
             Command::Invalid(message) => eprintln!("{message}"),
             Command::Unknown(command) => eprintln!("unknown command: {command}"),
         }
     }
     Ok(())
+}
+
+fn upload_all(fs: &NullFS) {
+    let state = fs.state.read().unwrap().clone();
+    match DiscordClient::new().and_then(|client| client.upload_all(&state)) {
+        Ok(ids) => {
+            println!("uploaded {} inodes", ids.len());
+            let mut ids: Vec<_> = ids.into_iter().collect();
+            ids.sort_unstable_by_key(|(ino, _)| ino.0);
+            for (ino, message_id) in ids {
+                println!("{} -> {message_id}", ino.0);
+            }
+        }
+        Err(error) => eprintln!("upload failed: {error}"),
+    }
 }
 
 fn print_state(fs: &NullFS) {
