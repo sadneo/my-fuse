@@ -1,8 +1,8 @@
 use clap::Parser;
 use fuser::{
     FileAttr, FileHandle, FileType, Filesystem, FopenFlags, Generation, INodeNo, LockOwner,
-    OpenFlags, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry,
-    ReplyOpen, ReplyWrite, Request,
+    OpenFlags, RenameFlags, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty,
+    ReplyEntry, ReplyOpen, ReplyWrite, Request,
 };
 
 use std::collections::{BTreeMap, HashMap};
@@ -306,6 +306,98 @@ impl NullFS {
         Ok(())
     }
 
+    fn rename_node(
+        &self,
+        parent: INodeNo,
+        name: &OsStr,
+        newparent: INodeNo,
+        newname: &OsStr,
+        flags: RenameFlags,
+    ) -> Result<(), fuser::Errno> {
+        if !flags.is_empty()
+            || name.is_empty()
+            || name == OsStr::new(".")
+            || name == OsStr::new("..")
+            || newname.is_empty()
+            || newname == OsStr::new(".")
+            || newname == OsStr::new("..")
+        {
+            return Err(fuser::Errno::EINVAL);
+        }
+
+        let mut state = self.state.write().unwrap();
+        let source_parent = state.inodes.get(&parent).ok_or(fuser::Errno::ENOENT)?;
+        if source_parent.kind != FileType::Directory {
+            return Err(fuser::Errno::ENOTDIR);
+        }
+        let destination_parent = state
+            .inodes
+            .get(&newparent)
+            .ok_or(fuser::Errno::ENOENT)?;
+        if destination_parent.kind != FileType::Directory {
+            return Err(fuser::Errno::ENOTDIR);
+        }
+
+        let source_ino = *source_parent.children.get(name).ok_or(fuser::Errno::ENOENT)?;
+        if parent == newparent && name == newname {
+            return Ok(());
+        }
+        let source_kind = state.inodes[&source_ino].kind;
+        if source_kind == FileType::Directory
+            && (source_ino == newparent || Self::contains_inode(&state, source_ino, newparent))
+        {
+            return Err(fuser::Errno::EINVAL);
+        }
+
+        let destination_ino = destination_parent.children.get(newname).copied();
+        if let Some(destination_ino) = destination_ino {
+            let destination = &state.inodes[&destination_ino];
+            match (source_kind == FileType::Directory, destination.kind == FileType::Directory) {
+                (false, true) => return Err(fuser::Errno::EISDIR),
+                (true, false) => return Err(fuser::Errno::ENOTDIR),
+                (true, true) if !destination.children.is_empty() => {
+                    return Err(fuser::Errno::ENOTEMPTY);
+                }
+                _ => {}
+            }
+        }
+
+        let now = SystemTime::now();
+        state.inodes.get_mut(&parent).unwrap().children.remove(name);
+        state
+            .inodes
+            .get_mut(&newparent)
+            .unwrap()
+            .children
+            .remove(newname);
+        state
+            .inodes
+            .get_mut(&newparent)
+            .unwrap()
+            .children
+            .insert(newname.to_os_string(), source_ino);
+        {
+            let source_parent = state.inodes.get_mut(&parent).unwrap();
+            source_parent.mtime = now;
+            source_parent.ctime = now;
+        }
+        if parent != newparent {
+            let destination_parent = state.inodes.get_mut(&newparent).unwrap();
+            destination_parent.mtime = now;
+            destination_parent.ctime = now;
+        }
+        if let Some(destination_ino) = destination_ino.filter(|ino| *ino != source_ino) {
+            state.inodes.remove(&destination_ino);
+        }
+        Ok(())
+    }
+
+    fn contains_inode(state: &FsState, parent: INodeNo, candidate: INodeNo) -> bool {
+        state.inodes[&parent].children.values().copied().any(|child| {
+            child == candidate || Self::contains_inode(state, child, candidate)
+        })
+    }
+
     fn write_node(&self, ino: INodeNo, offset: u64, data: &[u8]) -> Result<(), fuser::Errno> {
         let start = usize::try_from(offset).map_err(|_| fuser::Errno::EFBIG)?;
         let end = start.checked_add(data.len()).ok_or(fuser::Errno::EFBIG)?;
@@ -513,6 +605,22 @@ impl Filesystem for NullFS {
 
     fn rmdir(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
         match self.rmdir_node(parent, name) {
+            Ok(()) => reply.ok(),
+            Err(err) => reply.error(err),
+        }
+    }
+
+    fn rename(
+        &self,
+        _req: &Request,
+        parent: INodeNo,
+        name: &OsStr,
+        newparent: INodeNo,
+        newname: &OsStr,
+        flags: RenameFlags,
+        reply: ReplyEmpty,
+    ) {
+        match self.rename_node(parent, name, newparent, newname, flags) {
             Ok(()) => reply.ok(),
             Err(err) => reply.error(err),
         }
@@ -737,6 +845,237 @@ mod tests {
         assert_eq!(
             fs.rmdir_node(INodeNo::ROOT, OsStr::new("hello.txt")),
             Err(fuser::Errno::ENOTDIR)
+        );
+    }
+
+    #[test]
+    fn rename_moves_files_and_directories_without_changing_their_inodes() {
+        let fs = NullFS::new();
+        let source_dir = fs
+            .create_node(
+                INodeNo::ROOT,
+                OsStr::new("source"),
+                FileType::Directory,
+                0o755,
+                0,
+                1000,
+                1000,
+            )
+            .unwrap()
+            .ino;
+        let destination_dir = fs
+            .create_node(
+                INodeNo::ROOT,
+                OsStr::new("destination"),
+                FileType::Directory,
+                0o755,
+                0,
+                1000,
+                1000,
+            )
+            .unwrap()
+            .ino;
+        let file = fs
+            .create_node(
+                source_dir,
+                OsStr::new("file"),
+                FileType::RegularFile,
+                0o644,
+                0,
+                1000,
+                1000,
+            )
+            .unwrap()
+            .ino;
+        fs.write_node(file, 0, b"contents").unwrap();
+
+        fs.rename_node(
+            source_dir,
+            OsStr::new("file"),
+            destination_dir,
+            OsStr::new("renamed"),
+            RenameFlags::empty(),
+        )
+        .unwrap();
+        fs.rename_node(
+            INodeNo::ROOT,
+            OsStr::new("source"),
+            destination_dir,
+            OsStr::new("moved-source"),
+            RenameFlags::empty(),
+        )
+        .unwrap();
+
+        let state = fs.state.read().unwrap();
+        assert_eq!(state.inodes[&destination_dir].children[OsStr::new("renamed")], file);
+        assert_eq!(state.inodes[&file].contents, b"contents");
+        assert_eq!(
+            state.inodes[&destination_dir].children[OsStr::new("moved-source")],
+            source_dir
+        );
+    }
+
+    #[test]
+    fn rename_replaces_compatible_destinations() {
+        let fs = NullFS::new();
+        let source = fs
+            .create_node(
+                INodeNo::ROOT,
+                OsStr::new("source"),
+                FileType::RegularFile,
+                0o644,
+                0,
+                1000,
+                1000,
+            )
+            .unwrap()
+            .ino;
+        let replaced = fs
+            .create_node(
+                INodeNo::ROOT,
+                OsStr::new("destination"),
+                FileType::RegularFile,
+                0o644,
+                0,
+                1000,
+                1000,
+            )
+            .unwrap()
+            .ino;
+
+        fs.rename_node(
+            INodeNo::ROOT,
+            OsStr::new("source"),
+            INodeNo::ROOT,
+            OsStr::new("destination"),
+            RenameFlags::empty(),
+        )
+        .unwrap();
+
+        let state = fs.state.read().unwrap();
+        assert_eq!(state.inodes[&INodeNo::ROOT].children[OsStr::new("destination")], source);
+        assert!(!state.inodes.contains_key(&replaced));
+    }
+
+    #[test]
+    fn rename_rejects_invalid_replacements_cycles_and_flags() {
+        let fs = NullFS::new();
+        let directory = fs
+            .create_node(
+                INodeNo::ROOT,
+                OsStr::new("directory"),
+                FileType::Directory,
+                0o755,
+                0,
+                1000,
+                1000,
+            )
+            .unwrap()
+            .ino;
+        let child = fs
+            .create_node(
+                directory,
+                OsStr::new("child"),
+                FileType::Directory,
+                0o755,
+                0,
+                1000,
+                1000,
+            )
+            .unwrap()
+            .ino;
+        fs.create_node(
+            INodeNo::ROOT,
+            OsStr::new("file"),
+            FileType::RegularFile,
+            0o644,
+            0,
+            1000,
+            1000,
+        )
+        .unwrap();
+        fs.create_node(
+            INodeNo::ROOT,
+            OsStr::new("empty"),
+            FileType::Directory,
+            0o755,
+            0,
+            1000,
+            1000,
+        )
+        .unwrap();
+        let occupied = fs
+            .create_node(
+                INodeNo::ROOT,
+                OsStr::new("occupied"),
+                FileType::Directory,
+                0o755,
+                0,
+                1000,
+                1000,
+            )
+            .unwrap()
+            .ino;
+        fs.create_node(
+            occupied,
+            OsStr::new("child"),
+            FileType::RegularFile,
+            0o644,
+            0,
+            1000,
+            1000,
+        )
+        .unwrap();
+
+        assert_eq!(
+            fs.rename_node(
+                INodeNo::ROOT,
+                OsStr::new("file"),
+                INodeNo::ROOT,
+                OsStr::new("directory"),
+                RenameFlags::empty(),
+            ),
+            Err(fuser::Errno::EISDIR)
+        );
+        assert_eq!(
+            fs.rename_node(
+                INodeNo::ROOT,
+                OsStr::new("directory"),
+                INodeNo::ROOT,
+                OsStr::new("file"),
+                RenameFlags::empty(),
+            ),
+            Err(fuser::Errno::ENOTDIR)
+        );
+        assert_eq!(
+            fs.rename_node(
+                INodeNo::ROOT,
+                OsStr::new("empty"),
+                INodeNo::ROOT,
+                OsStr::new("occupied"),
+                RenameFlags::empty(),
+            ),
+            Err(fuser::Errno::ENOTEMPTY)
+        );
+        assert_eq!(
+            fs.rename_node(
+                INodeNo::ROOT,
+                OsStr::new("directory"),
+                child,
+                OsStr::new("loop"),
+                RenameFlags::empty(),
+            ),
+            Err(fuser::Errno::EINVAL)
+        );
+        assert_eq!(
+            fs.rename_node(
+                INodeNo::ROOT,
+                OsStr::new("file"),
+                INodeNo::ROOT,
+                OsStr::new("flagged"),
+                RenameFlags::from_bits_retain(1),
+            ),
+            Err(fuser::Errno::EINVAL)
         );
     }
 }
