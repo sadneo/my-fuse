@@ -1,4 +1,5 @@
 /target
+/.env
 
 # test mount point
 /mnt
