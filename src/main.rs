@@ -1,3 +1,5 @@
+mod repl;
+
 use clap::Parser;
 use fuser::{
     FileAttr, FileHandle, FileType, Filesystem, FopenFlags, Generation, INodeNo, LockOwner,
@@ -8,7 +10,6 @@ use fuser::{
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::{OsStr, OsString};
 use std::path::PathBuf;
-use std::sync::mpsc;
 use std::sync::RwLock;
 use std::time::{Duration, SystemTime};
 
@@ -1083,13 +1084,17 @@ mod tests {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
     let cfg = args.config();
-    let (interrupt_tx, interrupt_rx) = mpsc::channel();
-    ctrlc::set_handler(move || {
-        let _ = interrupt_tx.send(());
-    })?;
-
     let session = fuser::spawn_mount(NullFS::new(), &args.mount_point, &cfg)?;
-    interrupt_rx.recv()?;
+    let mut repl = repl::Repl::new()?;
+
+    loop {
+        match repl.read_command()? {
+            repl::Command::Help => println!("Commands: help, exit, quit"),
+            repl::Command::Exit => break,
+            repl::Command::Unknown(command) => eprintln!("unknown command: {command}"),
+        }
+    }
+
     session.umount_and_join()?;
     Ok(())
 }
