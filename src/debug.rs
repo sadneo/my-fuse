@@ -1,6 +1,6 @@
 use fuser::{FileType, INodeNo};
 
-use crate::{FsState, NullFS, discord::DiscordClient, repl::Repl};
+use crate::{DiscordFS, FsState, discord::DiscordClient, repl::Repl};
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Command {
@@ -11,19 +11,21 @@ pub enum Command {
     Stat(INodeNo),
     Cat(INodeNo),
     UploadAll,
+    ClearAll,
+    ClearLocal,
     Exit,
     Invalid(String),
     Unknown(String),
 }
 
-pub fn run(fs: &NullFS) -> rustyline::Result<()> {
+pub fn run(fs: &DiscordFS) -> rustyline::Result<()> {
     let mut repl = Repl::new()?;
     loop {
         match repl.read_command()? {
             Command::Empty => {}
             Command::Help => {
                 println!(
-                    "Commands: help, state, tree, stat <inode>, cat <inode>, upload-all, exit, quit"
+                    "Commands: help, state, tree, stat <inode>, cat <inode>, upload-all, clear-all, clear-local, exit, quit"
                 )
             }
             Command::State => print_state(fs),
@@ -31,6 +33,11 @@ pub fn run(fs: &NullFS) -> rustyline::Result<()> {
             Command::Stat(ino) => print_stat(fs, ino),
             Command::Cat(ino) => print_cat(fs, ino),
             Command::UploadAll => upload_all(fs),
+            Command::ClearAll => clear_all(),
+            Command::ClearLocal => {
+                fs.clear_local();
+                println!("cleared local filesystem");
+            }
             Command::Exit => break,
             Command::Invalid(message) => eprintln!("{message}"),
             Command::Unknown(command) => eprintln!("unknown command: {command}"),
@@ -39,7 +46,14 @@ pub fn run(fs: &NullFS) -> rustyline::Result<()> {
     Ok(())
 }
 
-fn upload_all(fs: &NullFS) {
+fn clear_all() {
+    match DiscordClient::new().and_then(|client| client.clear_all()) {
+        Ok(count) => println!("deleted {count} messages"),
+        Err(error) => eprintln!("clear failed: {error}"),
+    }
+}
+
+fn upload_all(fs: &DiscordFS) {
     let state = fs.state.read().unwrap().clone();
     match DiscordClient::new().and_then(|client| client.upload_all(&state)) {
         Ok(ids) => {
@@ -54,12 +68,12 @@ fn upload_all(fs: &NullFS) {
     }
 }
 
-fn print_state(fs: &NullFS) {
+fn print_state(fs: &DiscordFS) {
     let state = fs.state.read().unwrap();
     println!("inodes: {}\nnext inode: {}", state.inodes.len(), state.next_ino);
 }
 
-fn print_tree(fs: &NullFS) {
+fn print_tree(fs: &DiscordFS) {
     fn visit(state: &FsState, ino: INodeNo, name: &str, depth: usize) {
         let Some(node) = state.inodes.get(&ino) else {
             println!("{}{} ({}) [missing]", "  ".repeat(depth), name, ino.0);
@@ -82,7 +96,7 @@ fn print_tree(fs: &NullFS) {
     visit(&fs.state.read().unwrap(), INodeNo::ROOT, "/", 0);
 }
 
-fn print_stat(fs: &NullFS, ino: INodeNo) {
+fn print_stat(fs: &DiscordFS, ino: INodeNo) {
     let state = fs.state.read().unwrap();
     let Some(node) = state.inodes.get(&ino) else {
         eprintln!("inode {} not found", ino.0);
@@ -103,7 +117,7 @@ fn print_stat(fs: &NullFS, ino: INodeNo) {
     );
 }
 
-fn print_cat(fs: &NullFS, ino: INodeNo) {
+fn print_cat(fs: &DiscordFS, ino: INodeNo) {
     let state = fs.state.read().unwrap();
     let Some(node) = state.inodes.get(&ino) else {
         eprintln!("inode {} not found", ino.0);

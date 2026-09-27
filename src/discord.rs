@@ -120,6 +120,23 @@ impl DiscordClient {
         Ok(ids)
     }
 
+    pub fn clear_all(&self) -> Result<usize> {
+        let messages_url = format!("{API_BASE}/channels/{}/messages", self.channel_id);
+        let list_url = format!("{messages_url}?limit=100");
+        let mut deleted = 0;
+        loop {
+            let messages: Vec<Message> = self.send(|| self.client.get(&list_url))?;
+            if messages.is_empty() {
+                return Ok(deleted);
+            }
+            for message in messages {
+                let url = format!("{messages_url}/{}", message.id);
+                self.send_empty(|| self.client.delete(&url))?;
+                deleted += 1;
+            }
+        }
+    }
+
     fn upload_inode(
         &self,
         node: &Node,
@@ -204,6 +221,19 @@ impl DiscordClient {
             return Ok(response.error_for_status()?.json()?);
         }
     }
+
+    fn send_empty(&self, mut request: impl FnMut() -> RequestBuilder) -> Result<()> {
+        loop {
+            let response = request().send()?;
+            if response.status() == StatusCode::TOO_MANY_REQUESTS {
+                let limit: RateLimit = response.json()?;
+                thread::sleep(Duration::from_secs_f64(limit.retry_after));
+                continue;
+            }
+            response.error_for_status()?;
+            return Ok(());
+        }
+    }
 }
 
 fn validate_tree(state: &FsState) -> Result<()> {
@@ -268,12 +298,12 @@ mod tests {
 
     #[test]
     fn current_filesystem_is_a_valid_tree() {
-        validate_tree(&crate::NullFS::new().state.read().unwrap()).unwrap();
+        validate_tree(&crate::DiscordFS::new().state.read().unwrap()).unwrap();
     }
 
     #[test]
     fn root_metadata_has_the_root_marker() {
-        let state = crate::NullFS::new();
+        let state = crate::DiscordFS::new();
         let state = state.state.read().unwrap();
         let node = &state.inodes[&INodeNo::ROOT];
         let metadata = Metadata {

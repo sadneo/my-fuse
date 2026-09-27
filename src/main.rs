@@ -85,11 +85,11 @@ struct FsState {
 }
 
 #[derive(Clone)]
-struct NullFS {
+struct DiscordFS {
     state: Arc<RwLock<FsState>>,
 }
 
-impl NullFS {
+impl DiscordFS {
     fn new() -> Self {
         let now = SystemTime::now();
         let mut inodes = HashMap::new();
@@ -122,12 +122,43 @@ impl NullFS {
             },
         );
 
-        Self {
+        let fs = Self {
             state: Arc::new(RwLock::new(FsState {
                 next_ino: HELLO.0 + 1,
                 inodes,
             })),
+        };
+        for index in 0..127 {
+            fs.create_node(
+                INodeNo::ROOT,
+                OsStr::new(&format!("page-test-{index:03}.txt")),
+                FileType::RegularFile,
+                0o644,
+                0,
+                0,
+                0,
+            )
+            .unwrap();
         }
+        fs
+    }
+
+    fn clear_local(&self) {
+        let root = Node {
+            kind: FileType::Directory,
+            perm: 0o777,
+            uid: 0,
+            gid: 0,
+            contents: Vec::new(),
+            children: BTreeMap::new(),
+            atime: SystemTime::UNIX_EPOCH,
+            mtime: SystemTime::UNIX_EPOCH,
+            ctime: SystemTime::UNIX_EPOCH,
+        };
+        *self.state.write().unwrap() = FsState {
+            next_ino: INodeNo::ROOT.0 + 1,
+            inodes: HashMap::from([(INodeNo::ROOT, root)]),
+        };
     }
 
     fn attr(ino: INodeNo, node: &Node) -> FileAttr {
@@ -420,7 +451,7 @@ impl NullFS {
     }
 }
 
-impl Filesystem for NullFS {
+impl Filesystem for DiscordFS {
     fn getattr(&self, _req: &Request, ino: INodeNo, _fh: Option<FileHandle>, reply: ReplyAttr) {
         let state = self.state.read().unwrap();
         let Some(node) = state.inodes.get(&ino) else {
@@ -668,9 +699,11 @@ mod tests {
 
     #[test]
     fn root_contains_hello_world() {
-        let fs = NullFS::new();
+        let fs = DiscordFS::new();
         let state = fs.state.read().unwrap();
         assert_eq!(state.inodes[&HELLO].contents, b"hello world");
+        assert_eq!(state.inodes.len(), 129);
+        assert_eq!(state.inodes[&INodeNo::ROOT].children.len(), 128);
         assert_eq!(
             state.inodes[&INodeNo::ROOT].children[OsStr::new("hello.txt")],
             HELLO
@@ -678,8 +711,25 @@ mod tests {
     }
 
     #[test]
+    fn clear_local_leaves_only_a_sentinel_root() {
+        let fs = DiscordFS::new();
+        fs.clear_local();
+
+        let state = fs.state.read().unwrap();
+        assert_eq!(state.inodes.len(), 1);
+        assert_eq!(state.next_ino, INodeNo::ROOT.0 + 1);
+        let root = &state.inodes[&INodeNo::ROOT];
+        assert_eq!(root.kind, FileType::Directory);
+        assert_eq!(root.perm, 0o777);
+        assert!(root.children.is_empty());
+        assert_eq!(root.atime, SystemTime::UNIX_EPOCH);
+        assert_eq!(root.mtime, SystemTime::UNIX_EPOCH);
+        assert_eq!(root.ctime, SystemTime::UNIX_EPOCH);
+    }
+
+    #[test]
     fn create_adds_a_file_with_masked_permissions() {
-        let fs = NullFS::new();
+        let fs = DiscordFS::new();
         let attr = fs
             .create_node(
                 INodeNo::ROOT,
@@ -703,7 +753,7 @@ mod tests {
 
     #[test]
     fn write_extends_files_with_zeroes() {
-        let fs = NullFS::new();
+        let fs = DiscordFS::new();
         fs.write_node(HELLO, 13, b"!").unwrap();
 
         let state = fs.state.read().unwrap();
@@ -712,7 +762,7 @@ mod tests {
 
     #[test]
     fn setattr_updates_metadata_and_truncates_files() {
-        let fs = NullFS::new();
+        let fs = DiscordFS::new();
         let atime = SystemTime::UNIX_EPOCH + Duration::from_secs(10);
         let mtime = SystemTime::UNIX_EPOCH + Duration::from_secs(20);
         let attr = fs
@@ -739,7 +789,7 @@ mod tests {
 
     #[test]
     fn setattr_cannot_truncate_a_directory() {
-        let fs = NullFS::new();
+        let fs = DiscordFS::new();
 
         assert_eq!(
             fs.setattr_node(INodeNo::ROOT, None, None, None, Some(0), None, None, None),
@@ -749,7 +799,7 @@ mod tests {
 
     #[test]
     fn mkdir_adds_an_empty_directory_with_masked_permissions() {
-        let fs = NullFS::new();
+        let fs = DiscordFS::new();
         let attr = fs
             .create_node(
                 INodeNo::ROOT,
@@ -771,7 +821,7 @@ mod tests {
 
     #[test]
     fn unlink_removes_a_file_but_not_a_directory() {
-        let fs = NullFS::new();
+        let fs = DiscordFS::new();
         fs.create_node(
             INodeNo::ROOT,
             OsStr::new("docs"),
@@ -804,7 +854,7 @@ mod tests {
 
     #[test]
     fn rmdir_removes_empty_directories_only() {
-        let fs = NullFS::new();
+        let fs = DiscordFS::new();
         let empty = fs
             .create_node(
                 INodeNo::ROOT,
@@ -856,7 +906,7 @@ mod tests {
 
     #[test]
     fn rename_moves_files_and_directories_without_changing_their_inodes() {
-        let fs = NullFS::new();
+        let fs = DiscordFS::new();
         let source_dir = fs
             .create_node(
                 INodeNo::ROOT,
@@ -923,7 +973,7 @@ mod tests {
 
     #[test]
     fn rename_replaces_compatible_destinations() {
-        let fs = NullFS::new();
+        let fs = DiscordFS::new();
         let source = fs
             .create_node(
                 INodeNo::ROOT,
@@ -965,7 +1015,7 @@ mod tests {
 
     #[test]
     fn rename_rejects_invalid_replacements_cycles_and_flags() {
-        let fs = NullFS::new();
+        let fs = DiscordFS::new();
         let directory = fs
             .create_node(
                 INodeNo::ROOT,
@@ -1089,7 +1139,7 @@ mod tests {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
     let cfg = args.config();
-    let fs = NullFS::new();
+    let fs = DiscordFS::new();
     let session = fuser::spawn_mount(fs.clone(), &args.mount_point, &cfg)?;
     let debug_result = debug::run(&fs);
     let unmount_result = session.umount_and_join();
