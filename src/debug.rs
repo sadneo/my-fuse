@@ -11,6 +11,7 @@ pub enum Command {
     Stat(INodeNo),
     Cat(INodeNo),
     UploadAll,
+    DownloadAll,
     ClearAll,
     ClearLocal,
     Exit,
@@ -25,7 +26,7 @@ pub fn run(fs: &DiscordFS) -> rustyline::Result<()> {
             Command::Empty => {}
             Command::Help => {
                 println!(
-                    "Commands: help, state, tree, stat <inode>, cat <inode>, upload-all, clear-all, clear-local, exit, quit"
+                    "Commands: help, state, tree, stat <inode>, cat <inode>, upload-all, download-all, clear-all, clear-local, exit, quit"
                 )
             }
             Command::State => print_state(fs),
@@ -33,6 +34,7 @@ pub fn run(fs: &DiscordFS) -> rustyline::Result<()> {
             Command::Stat(ino) => print_stat(fs, ino),
             Command::Cat(ino) => print_cat(fs, ino),
             Command::UploadAll => upload_all(fs),
+            Command::DownloadAll => download_all(fs),
             Command::ClearAll => clear_all(),
             Command::ClearLocal => {
                 fs.clear_local();
@@ -65,6 +67,17 @@ fn upload_all(fs: &DiscordFS) {
             }
         }
         Err(error) => eprintln!("upload failed: {error}"),
+    }
+}
+
+fn download_all(fs: &DiscordFS) {
+    match DiscordClient::new().and_then(|client| client.download_all()) {
+        Ok(state) => {
+            let count = state.inodes.len();
+            *fs.state.write().unwrap() = state;
+            println!("downloaded {count} inodes");
+        }
+        Err(error) => eprintln!("download failed: {error}"),
     }
 }
 

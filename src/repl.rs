@@ -20,8 +20,8 @@ impl Highlighter for ReplHelper {
     fn highlight<'line>(&self, line: &'line str, _pos: usize) -> Cow<'line, str> {
         let command = line.split_whitespace().next().unwrap_or_default();
         let color = match command {
-            "help" | "state" | "tree" | "stat" | "cat" | "upload-all" | "clear-all"
-            | "clear-local" => "\x1b[36m",
+            "help" | "state" | "tree" | "stat" | "cat" | "upload-all" | "download-all"
+            | "clear-all" | "clear-local" => "\x1b[36m",
             "exit" | "quit" => "\x1b[33m",
             "" => return Cow::Borrowed(line),
             _ => "\x1b[31m",
@@ -74,6 +74,7 @@ fn parse(line: &str) -> Command {
         "state" => Command::State,
         "tree" => Command::Tree,
         "upload-all" => Command::UploadAll,
+        "download-all" => Command::DownloadAll,
         "clear-all" => Command::ClearAll,
         "clear-local" => Command::ClearLocal,
         "exit" | "quit" => Command::Exit,
@@ -102,6 +103,7 @@ mod tests {
         assert_eq!(parse("stat 2"), Command::Stat(fuser::INodeNo(2)));
         assert_eq!(parse("cat 2"), Command::Cat(fuser::INodeNo(2)));
         assert_eq!(parse("upload-all"), Command::UploadAll);
+        assert_eq!(parse("download-all"), Command::DownloadAll);
         assert_eq!(parse("clear-all"), Command::ClearAll);
         assert_eq!(parse("clear-local"), Command::ClearLocal);
         assert_eq!(

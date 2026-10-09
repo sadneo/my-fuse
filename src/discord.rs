@@ -1,4 +1,5 @@
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::ffi::OsString;
 use std::env;
 use std::error::Error;
 use std::io;
@@ -21,6 +22,7 @@ type Result<T> = std::result::Result<T, Box<dyn Error + Send + Sync>>;
 
 pub struct DiscordClient {
     client: Client,
+    download_client: Client,
     #[allow(dead_code)]
     guild_id: String,
     channel_id: String,
@@ -66,6 +68,30 @@ struct NewAttachment {
 #[derive(Deserialize)]
 struct Message {
     id: String,
+    content: String,
+    attachments: Vec<Attachment>,
+}
+
+#[derive(Deserialize)]
+struct Attachment {
+    url: String,
+    size: usize,
+}
+
+#[derive(Deserialize)]
+struct DownloadedMetadata {
+    version: u8,
+    kind: String,
+    name: String,
+    parent_id: Option<String>,
+    mode: u16,
+    uid: u32,
+    gid: u32,
+    size: Option<usize>,
+    sha256: Option<String>,
+    atime: String,
+    mtime: String,
+    ctime: String,
 }
 
 #[derive(Deserialize)]
@@ -91,9 +117,17 @@ impl DiscordClient {
                 ")"
             ))
             .build()?;
+        let download_client = Client::builder()
+            .user_agent(concat!(
+                "DiscordBot (https://github.com/aidan/discordfs, ",
+                env!("CARGO_PKG_VERSION"),
+                ")"
+            ))
+            .build()?;
 
         Ok(Self {
             client,
+            download_client,
             guild_id,
             channel_id,
         })
@@ -135,6 +169,44 @@ impl DiscordClient {
                 deleted += 1;
             }
         }
+    }
+
+    pub fn download_all(&self) -> Result<FsState> {
+        let messages_url = format!("{API_BASE}/channels/{}/messages", self.channel_id);
+        let mut messages = Vec::new();
+        let mut before = None;
+        loop {
+            let url = match &before {
+                Some(id) => format!("{messages_url}?limit=100&before={id}"),
+                None => format!("{messages_url}?limit=100"),
+            };
+            let batch: Vec<Message> = self.send(|| self.client.get(&url))?;
+            if batch.is_empty() {
+                break;
+            }
+            before = batch.last().map(|message| message.id.clone());
+            messages.extend(batch);
+        }
+
+        reconstruct(messages, |attachment| self.download(attachment))
+    }
+
+    fn download(&self, attachment: &Attachment) -> Result<Vec<u8>> {
+        let data = self
+            .download_client
+            .get(&attachment.url)
+            .send()?
+            .error_for_status()?
+            .bytes()?
+            .to_vec();
+        if data.len() != attachment.size {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "attachment size does not match Discord metadata",
+            )
+            .into());
+        }
+        Ok(data)
     }
 
     fn upload_inode(
@@ -236,6 +308,159 @@ impl DiscordClient {
     }
 }
 
+fn reconstruct(
+    messages: Vec<Message>,
+    mut download: impl FnMut(&Attachment) -> Result<Vec<u8>>,
+) -> Result<FsState> {
+    let mut records = Vec::new();
+    let mut ids = HashMap::new();
+    let mut root_found = false;
+
+    for message in messages {
+        let Some((metadata, root)) = parse_metadata(&message.content)? else {
+            continue;
+        };
+        if metadata.version != 1 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("unsupported metadata version {}", metadata.version),
+            )
+            .into());
+        }
+        let ino = if root {
+            if root_found {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "multiple roots").into());
+            }
+            root_found = true;
+            INodeNo::ROOT
+        } else {
+            INodeNo(message.id.parse()?)
+        };
+        if ids.insert(message.id.clone(), ino).is_some() {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "duplicate message ID").into());
+        }
+        records.push((ino, message, metadata, root));
+    }
+
+    if !root_found {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "root message is missing").into());
+    }
+
+    let mut inodes = HashMap::new();
+    let mut parents = Vec::new();
+    for (ino, message, metadata, root) in records {
+        let kind = match metadata.kind.as_str() {
+            "directory" => FileType::Directory,
+            "file" => FileType::RegularFile,
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("inode {} has invalid type", ino.0),
+                )
+                .into());
+            }
+        };
+        if root != metadata.parent_id.is_none() || (root && kind != FileType::Directory) {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid root metadata").into());
+        }
+        let contents = if kind == FileType::RegularFile {
+            let [attachment] = message.attachments.as_slice() else {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("file inode {} must have one attachment", ino.0),
+                )
+                .into());
+            };
+            let contents = download(attachment)?;
+            if metadata.size != Some(contents.len())
+                || metadata.sha256.as_deref()
+                    != Some(format!("{:x}", Sha256::digest(&contents)).as_str())
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("file inode {} failed integrity checks", ino.0),
+                )
+                .into());
+            }
+            contents
+        } else {
+            if !message.attachments.is_empty()
+                || metadata.size.is_some()
+                || metadata.sha256.is_some()
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("directory inode {} has file data", ino.0),
+                )
+                .into());
+            }
+            Vec::new()
+        };
+        let node = Node {
+            kind,
+            perm: metadata.mode,
+            uid: metadata.uid,
+            gid: metadata.gid,
+            contents,
+            children: BTreeMap::new(),
+            atime: parse_timestamp(&metadata.atime)?,
+            mtime: parse_timestamp(&metadata.mtime)?,
+            ctime: parse_timestamp(&metadata.ctime)?,
+        };
+        if inodes.insert(ino, node).is_some() {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "duplicate inode").into());
+        }
+        parents.push((ino, OsString::from(metadata.name), metadata.parent_id));
+    }
+
+    for (ino, name, parent_id) in parents {
+        let Some(parent_id) = parent_id else {
+            continue;
+        };
+        let parent = *ids.get(&parent_id).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("inode {} has a missing parent", ino.0),
+            )
+        })?;
+        let parent = inodes.get_mut(&parent).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "parent inode is missing")
+        })?;
+        if parent.children.insert(name, ino).is_some() {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "duplicate filename").into());
+        }
+    }
+
+    let next_ino = inodes
+        .keys()
+        .map(|ino| ino.0)
+        .max()
+        .unwrap_or(INodeNo::ROOT.0)
+        .checked_add(1)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "inode range exhausted"))?;
+    let state = FsState { next_ino, inodes };
+    validate_tree(&state)?;
+    Ok(state)
+}
+
+fn parse_metadata(content: &str) -> Result<Option<(DownloadedMetadata, bool)>> {
+    let (content, root) = match content.strip_prefix("### ROOT\n") {
+        Some(content) => (content, true),
+        None => (content, false),
+    };
+    let Some(json) = content
+        .strip_prefix("```json\n")
+        .and_then(|content| content.strip_suffix("\n```"))
+    else {
+        return Ok(None);
+    };
+    Ok(Some((serde_json::from_str(json)?, root)))
+}
+
+fn parse_timestamp(value: &str) -> Result<SystemTime> {
+    Ok(DateTime::parse_from_rfc3339(value)?.with_timezone(&Utc).into())
+}
+
 fn validate_tree(state: &FsState) -> Result<()> {
     let mut seen = HashSet::new();
     let mut queue = VecDeque::from([INodeNo::ROOT]);
@@ -327,5 +552,50 @@ mod tests {
 
         assert!(content.starts_with("### ROOT\n```json\n"));
         assert!(content.ends_with("\n```"));
+    }
+
+    #[test]
+    fn reconstructs_filesystem_from_messages() {
+        let timestamp = "1970-01-01T00:00:00Z";
+        let metadata = |kind: &str, name: &str, parent_id: Option<&str>, file: bool| {
+            serde_json::json!({
+                "version": 1,
+                "kind": kind,
+                "name": name,
+                "parent_id": parent_id,
+                "mode": if file { 420 } else { 493 },
+                "uid": 1000,
+                "gid": 1000,
+                "size": file.then_some(3),
+                "sha256": file.then_some(format!("{:x}", Sha256::digest(b"abc"))),
+                "atime": timestamp,
+                "mtime": timestamp,
+                "ctime": timestamp
+            })
+        };
+        let messages = vec![
+            Message {
+                id: "100".into(),
+                content: format!("### ROOT\n```json\n{}\n```", metadata("directory", "/", None, false)),
+                attachments: Vec::new(),
+            },
+            Message {
+                id: "200".into(),
+                content: format!("```json\n{}\n```", metadata("file", "file", Some("100"), true)),
+                attachments: vec![Attachment {
+                    url: "unused".into(),
+                    size: 3,
+                }],
+            },
+        ];
+
+        let state = reconstruct(messages, |_| Ok(b"abc".to_vec())).unwrap();
+
+        assert_eq!(state.next_ino, 201);
+        assert_eq!(state.inodes[&INodeNo(200)].contents, b"abc");
+        assert_eq!(
+            state.inodes[&INodeNo::ROOT].children[std::ffi::OsStr::new("file")],
+            INodeNo(200)
+        );
     }
 }
